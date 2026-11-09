@@ -1,0 +1,16 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.DS_Store
+.claude/settings.local.json
+[Uu]nity/**/Library/
+[Uu]nity/**/Temp/
+[Uu]nity/**/Logs/
+[Uu]nity/**/Builds/
+# infra / server (INFRA-001)
+infra/backups/
+apps/server/src/generated/
+*.dump
+apps/web/e2e/screenshots/

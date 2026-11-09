@@ -1,0 +1,21 @@
+{
+  "name": "officeyacht",
+  "private": true,
+  "description": "루트 편의 명령 전용(의존성 없음, workspace 아님). apps/web 과 apps/server 는 각자 독립 npm 프로젝트.",
+  "scripts": {
+    "env:init": "bash infra/scripts/init-env.sh",
+    "infra:up": "docker compose -f infra/compose.yml --env-file infra/.env up -d --wait",
+    "infra:up:app": "docker compose -f infra/compose.yml --env-file infra/.env --profile app up -d --build --wait",
+    "infra:ps": "docker compose -f infra/compose.yml --env-file infra/.env ps",
+    "infra:logs": "docker compose -f infra/compose.yml --env-file infra/.env logs -f --tail=100",
+    "infra:stop": "docker compose -f infra/compose.yml --env-file infra/.env stop",
+    "infra:down": "docker compose -f infra/compose.yml --env-file infra/.env --profile app down",
+    "infra:config": "docker compose -f infra/compose.yml --env-file infra/.env config --quiet",
+    "db:backup": "bash infra/scripts/pg-backup.sh",
+    "db:restore:check": "bash infra/scripts/pg-restore-test.sh",
+    "server:install": "npm --prefix apps/server ci",
+    "server:dev": "npm --prefix apps/server run dev",
+    "server:migrate": "npm --prefix apps/server run db:migrate:deploy",
+    "server:check": "npm --prefix apps/server run check:infra"
+  }
+}

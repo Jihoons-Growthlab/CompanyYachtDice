@@ -1,0 +1,350 @@
+// 데이터 모델 원본 초안: docs/db.md. INFRA-001 에서는 인증 기반 테이블만 둔다.
+// 변경 절차: 스키마 수정 → npm run db:migrate:create → SQL 검토 → npm run db:migrate:dev
+
+generator client {
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  moduleFormat        = "esm"
+  importFileExtension = "js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum AuthProvider {
+  KAKAO
+  GOOGLE
+  NAVER
+
+  @@map("auth_provider")
+}
+
+/// 사원. 최초 인증 직후에는 nickname/department_label 이 비어 있고 profile_completed_at 으로 완료를 판정한다.
+/// HUMAN: 실제 사용자, DEV: 테스트 모드 간편 로그인 계정, BOT: 테스트 모드 가상 플레이어
+enum UserKind {
+  HUMAN
+  DEV
+  BOT
+
+  @@map("user_kind")
+}
+
+model User {
+  id                 String    @id @default(uuid(7)) @db.Uuid
+  kind               UserKind  @default(HUMAN)
+  nickname           String?   @db.VarChar(40)
+  departmentLabel    String?   @map("department_label") @db.VarChar(60)
+  profileCompletedAt DateTime? @map("profile_completed_at") @db.Timestamptz(3)
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  externalIdentities ExternalIdentity[]
+  localCredential    LocalCredential?
+  sessions           Session[]
+  ownedRooms         Room[]
+  roomMemberships    RoomMember[]
+  matchSeats         MatchPlayer[]
+  sentInvites        RoomInvite[] @relation("InviteFrom")
+  receivedInvites    RoomInvite[] @relation("InviteTo")
+  chatMessages       ChatMessage[]
+  preferences        UserPreference?
+
+  @@map("users")
+}
+
+/// 제공자 + 불변 subject 로 계정을 식별한다. 이메일로 자동 병합하지 않는다.
+model ExternalIdentity {
+  id        String       @id @default(uuid(7)) @db.Uuid
+  userId    String       @map("user_id") @db.Uuid
+  provider  AuthProvider
+  subject   String       @db.VarChar(255)
+  createdAt DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@unique([provider, subject])
+  @@index([userId])
+  @@map("external_identities")
+}
+
+/// 이메일·비밀번호 로그인(P1). 소셜 로그인과 별도 자격 증명으로 users 에 연결한다.
+model LocalCredential {
+  userId            String   @id @map("user_id") @db.Uuid
+  /// 소문자·trim 정규화 후 저장
+  email             String   @unique @db.VarChar(254)
+  /// PHC 문자열: $argon2id$v=19$m=..,t=..,p=..$salt$hash
+  passwordHash      String   @map("password_hash")
+  passwordUpdatedAt DateTime @default(now()) @map("password_updated_at") @db.Timestamptz(3)
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("local_credentials")
+}
+
+enum SessionRevokeReason {
+  ROTATED
+  LOGOUT
+  LOGOUT_ALL
+  REUSE_DETECTED
+  EXPIRED
+
+  @@map("session_revoke_reason")
+}
+
+/// Refresh token 1개 = 1행. 회전 시 같은 family_id 로 새 행을 만들고 이전 행을 ROTATED 로 폐기한다.
+/// 이미 ROTATED 된 토큰이 다시 오면 탈취로 보고 family 전체를 폐기한다.
+model Session {
+  id                String               @id @default(uuid(7)) @db.Uuid
+  userId            String               @map("user_id") @db.Uuid
+  familyId          String               @map("family_id") @db.Uuid
+  /// SHA-256(hex) — 원문 토큰은 저장하지 않는다
+  refreshTokenHash  String               @unique @map("refresh_token_hash") @db.Char(64)
+  expiresAt         DateTime             @map("expires_at") @db.Timestamptz(3)
+  absoluteExpiresAt DateTime             @map("absolute_expires_at") @db.Timestamptz(3)
+  revokedAt         DateTime?            @map("revoked_at") @db.Timestamptz(3)
+  revokeReason      SessionRevokeReason? @map("revoke_reason")
+  replacedById      String?              @map("replaced_by_id") @db.Uuid
+  userAgent         String?              @map("user_agent") @db.VarChar(256)
+  createdAt         DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("sessions")
+}
+
+enum RoomStatus {
+  WAITING
+  PLAYING
+  CLOSED
+
+  @@map("room_status")
+}
+
+/// 게임방. 정원·턴 제한시간 허용 범위는 DB CHECK(2–6, 3–60초)로 넓게 막고, 일반 모드 허용값은 rooms.policy.ts 가 좁힌다.
+model Room {
+  id               String     @id @default(uuid(7)) @db.Uuid
+  name             String     @db.VarChar(40)
+  status           RoomStatus @default(WAITING)
+  capacity         Int        @db.SmallInt
+  turnTimeLimitSec Int        @map("turn_time_limit_sec") @db.SmallInt
+  ownerId          String     @map("owner_id") @db.Uuid
+  /// 테스트 모드에서 만든 방(초기화 대상)
+  isTest           Boolean    @default(false) @map("is_test")
+  /// 비공개 방은 입장 코드 또는 초대 수락으로만 입장
+  isPrivate        Boolean    @default(false) @map("is_private")
+  joinCode         String?    @map("join_code") @db.VarChar(8)
+  botsAllowed      Boolean    @default(true) @map("bots_allowed")
+  /// 채팅 순번 카운터(메시지 저장과 같은 트랜잭션에서 증가)
+  chatSeq          Int        @default(0) @map("chat_seq")
+  createdAt        DateTime   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime   @updatedAt @map("updated_at") @db.Timestamptz(3)
+  closedAt         DateTime?  @map("closed_at") @db.Timestamptz(3)
+
+  owner   User         @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  members  RoomMember[]
+  matches  Match[]
+  invites  RoomInvite[]
+  messages ChatMessage[]
+
+  @@index([status, createdAt])
+  @@map("rooms")
+}
+
+model RoomMember {
+  roomId   String   @map("room_id") @db.Uuid
+  userId   String   @map("user_id") @db.Uuid
+  ready    Boolean  @default(false)
+  joinedAt DateTime @default(now()) @map("joined_at") @db.Timestamptz(3)
+
+  room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([roomId, userId])
+  @@index([userId])
+  @@map("room_members")
+}
+
+enum MatchStatus {
+  ACTIVE
+  FINISHED
+  ABORTED
+
+  @@map("match_status")
+}
+
+enum PlayMode {
+  MANUAL
+  AUTO
+  AWAY
+
+  @@map("play_mode")
+}
+
+/// 진행 상태는 엔진 상태(state JSONB)가 원본이다. 명령마다 version 을 1 증가시키고 행 잠금 아래에서만 변경한다.
+/// 방마다 ACTIVE 매치는 하나(부분 UNIQUE, 마이그레이션 SQL).
+model Match {
+  id               String      @id @default(uuid(7)) @db.Uuid
+  roomId           String      @map("room_id") @db.Uuid
+  status           MatchStatus @default(ACTIVE)
+  ruleset          String      @default("yacht-v1") @db.VarChar(20)
+  version          Int         @default(0)
+  state            Json
+  turnTimeLimitSec Int         @map("turn_time_limit_sec") @db.SmallInt
+  turnDeadlineAt   DateTime?   @map("turn_deadline_at") @db.Timestamptz(3)
+  /// 시작 안내(규칙 설명) 대기 기한. 값이 있으면 안내 단계 — 턴 타이머·봇 진행이 멈춰 있다.
+  briefingDeadlineAt DateTime?   @map("briefing_deadline_at") @db.Timestamptz(3)
+  createdAt        DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  finishedAt       DateTime?   @map("finished_at") @db.Timestamptz(3)
+
+  room     Room           @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  players  MatchPlayer[]
+  commands MatchCommand[]
+
+  @@index([roomId])
+  @@index([status])
+  @@map("matches")
+}
+
+model MatchPlayer {
+  matchId             String   @map("match_id") @db.Uuid
+  userId              String   @map("user_id") @db.Uuid
+  seat                Int      @db.SmallInt
+  playMode            PlayMode @default(MANUAL) @map("play_mode")
+  consecutiveTimeouts Int      @default(0) @map("consecutive_timeouts")
+  /// 시간 초과·AWAY·AUTO 로 서버가 대신 확정한 턴 수 (보상 제외 판단 근거, economy.md)
+  autoTurns           Int      @default(0) @map("auto_turns")
+  /// 시작 안내 확인(또는 건너뛰기) 시각. 봇·자리 비움은 자동 확인
+  briefedAt           DateTime? @map("briefed_at") @db.Timestamptz(3)
+  total               Int?
+  rank                Int?
+
+  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([matchId, userId])
+  @@unique([matchId, seat])
+  @@index([userId])
+  @@map("match_players")
+}
+
+/// 명령 영수증: 같은 commandId 재전송은 기존 결과를 돌려주고, 본문이 다르면 IDEMPOTENCY_CONFLICT.
+model MatchCommand {
+  matchId       String   @map("match_id") @db.Uuid
+  userId        String   @map("user_id") @db.Uuid
+  commandId     String   @map("command_id") @db.Uuid
+  requestHash   String   @map("request_hash") @db.Char(64)
+  resultVersion Int      @map("result_version")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  match Match @relation(fields: [matchId], references: [id], onDelete: Cascade)
+
+  @@id([matchId, userId, commandId])
+  @@map("match_commands")
+}
+
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  CANCELLED
+
+  @@map("invite_status")
+}
+
+/// 게임방 초대. (room, target) 당 PENDING 은 하나(부분 UNIQUE, 마이그레이션 SQL). 만료는 조회 시 지연 처리.
+model RoomInvite {
+  id           String       @id @default(uuid(7)) @db.Uuid
+  roomId       String       @map("room_id") @db.Uuid
+  inviterId    String       @map("inviter_id") @db.Uuid
+  targetUserId String       @map("target_user_id") @db.Uuid
+  status       InviteStatus @default(PENDING)
+  expiresAt    DateTime     @map("expires_at") @db.Timestamptz(3)
+  createdAt    DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  respondedAt  DateTime?    @map("responded_at") @db.Timestamptz(3)
+
+  room    Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  inviter User @relation("InviteFrom", fields: [inviterId], references: [id], onDelete: Cascade)
+  target  User @relation("InviteTo", fields: [targetUserId], references: [id], onDelete: Cascade)
+
+  @@index([targetUserId, status])
+  @@index([roomId])
+  @@map("room_invites")
+}
+
+enum ChatKind {
+  TEXT
+  SYSTEM
+
+  @@map("chat_kind")
+}
+
+/// 방 채팅. seq 는 방별 증가 순번. 같은 (room,user,client_message_id) 는 한 번만 저장. 보관 기간 후 삭제(chat.policy).
+model ChatMessage {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  roomId          String   @map("room_id") @db.Uuid
+  seq             Int
+  kind            ChatKind
+  userId          String?  @map("user_id") @db.Uuid
+  /// 작성 시점 표시 정보 스냅샷(이후 닉네임·직급 변경과 무관하게 기록 유지)
+  senderNickname  String?  @map("sender_nickname") @db.VarChar(40)
+  senderRank      String?  @map("sender_rank") @db.VarChar(20)
+  body            String   @db.VarChar(1200)
+  clientMessageId String?  @map("client_message_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  room Room  @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@unique([roomId, seq])
+  @@unique([roomId, userId, clientMessageId])
+  @@index([createdAt])
+  @@map("chat_messages")
+}
+
+enum UiMode {
+  EXCEL
+  CMD
+
+  @@map("ui_mode")
+}
+
+enum UiScale {
+  SMALL
+  NORMAL
+  LARGE
+
+  @@map("ui_scale")
+}
+
+enum EffectSpeed {
+  FAST
+  NORMAL
+  SLOW
+
+  @@map("effect_speed")
+}
+
+/// 개인 화면·연출 설정(본인에게만 적용). 방장이 정하는 턴 제한시간·서버 봇 진행 속도와 무관하다.
+/// 행이 없으면 기본값을 쓴다(기존 사용자 데이터 변경 없음).
+model UserPreference {
+  userId           String      @id @map("user_id") @db.Uuid
+  uiMode           UiMode      @default(EXCEL) @map("ui_mode")
+  uiScale          UiScale     @default(NORMAL) @map("ui_scale")
+  effectSpeed      EffectSpeed @default(NORMAL) @map("effect_speed")
+  reducedMotion    Boolean     @default(false) @map("reduced_motion")
+  diceAnimation    Boolean     @default(true) @map("dice_animation")
+  turnNotification Boolean     @default(true) @map("turn_notification")
+  soundEnabled     Boolean     @default(false) @map("sound_enabled")
+  soundVolume      Int         @default(60) @map("sound_volume") @db.SmallInt
+  ribbonCollapsed  Boolean     @default(false) @map("ribbon_collapsed")
+  updatedAt        DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_preferences")
+}

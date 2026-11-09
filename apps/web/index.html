@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="ko">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>OfficeYacht · 컴퍼니 요트 다이스</title>
+<script>
+  // 첫 렌더링 전에 마지막으로 적용한 화면 설정(UI 모드·크기·애니메이션)을 붙여 테마 깜빡임을 막는다. 계정 정보는 저장하지 않는다.
+  try {
+    var p = JSON.parse(localStorage.getItem('oy.prefs.applied') || '{}'), d = document.documentElement
+    d.dataset.uiMode = p.uiMode === 'CMD' ? 'cmd' : 'excel'
+    d.dataset.uiScale = (p.uiScale || 'NORMAL').toLowerCase()
+    d.dataset.reducedMotion = p.reducedMotion ? 'on' : 'off'
+  } catch (e) { document.documentElement.dataset.uiMode = 'excel' }
+</script>
+</head>
+<body><div id="app"></div><script type="module" src="/src/main.js"></script></body>
+</html>

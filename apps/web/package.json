@@ -1,0 +1,27 @@
+{
+  "name": "officeyacht-mockup",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test:e2e": "node e2e/multiplayer.e2e.mjs",
+    "test:layout": "node e2e/layout.e2e.mjs",
+    "capture:layout": "node e2e/layout-capture.mjs",
+    "test:settings": "node e2e/settings.e2e.mjs"
+  },
+  "type": "module",
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0"
+  },
+  "private": true,
+  "dependencies": {
+    "socket.io-client": "4.8.4",
+    "vue": "3.5.45"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "6.0.10",
+    "playwright-core": "1.64.1",
+    "vite": "8.3.6"
+  }
+}

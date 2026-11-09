@@ -1,0 +1,93 @@
+# OfficeYacht 개발 인프라 (PostgreSQL + Redis)
+# 실행은 저장소 루트에서: npm run infra:up  (= docker compose -f infra/compose.yml --env-file infra/.env up -d --wait)
+# 필수 비밀값이 없으면 ${VAR:?msg} 로 compose 단계에서 즉시 실패한다.
+name: officeyacht
+
+services:
+  postgres:
+    image: postgres:18.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required (infra/.env)}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (infra/.env)}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required (infra/.env)}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      # loopback 전용. 충돌 시 infra/.env 의 PG_HOST_PORT 변경
+      - "127.0.0.1:${PG_HOST_PORT:-5432}:5432"
+    volumes:
+      # PG 18+ 이미지: PGDATA=/var/lib/postgresql/18/docker, 마운트 지점은 /var/lib/postgresql
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    stop_grace_period: 30s
+
+  redis:
+    image: redis:8.10.3-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required (infra/.env)}
+    # 비밀번호를 프로세스 인자에 남기지 않도록 tmpfs 의 설정 파일로 전달하고,
+    # 공식 entrypoint 로 exec 해 redis 사용자로 PID 1 실행(SIGTERM 정상 처리)한다.
+    tmpfs:
+      - /run/redis-conf
+    command:
+      - sh
+      - -c
+      - |
+        umask 077
+        printf 'requirepass %s\nappendonly yes\nappendfsync everysec\nprotected-mode no\n' "$$REDIS_PASSWORD" > /run/redis-conf/redis.conf
+        chown redis:redis /run/redis-conf/redis.conf
+        exec docker-entrypoint.sh redis-server /run/redis-conf/redis.conf
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      # REDISCLI_AUTH 로 전달해 인자·경고 로그에 비밀번호를 남기지 않는다.
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    stop_grace_period: 15s
+
+  # 선택: API 컨테이너 실행 (EC2 등 단일 호스트 배포 리허설). 기본 up 에는 포함되지 않는다.
+  # npm run infra:up:app  → 컨테이너 내부 주소(postgres:5432, redis:6379)로 접속
+  server:
+    profiles: ["app"]
+    image: officeyacht-api:local
+    build:
+      context: ..
+      dockerfile: apps/server/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # 인증 비밀값(JWT_ACCESS_SECRET 등)과 정책 값은 서버 .env 에서 읽고, 접속 주소만 아래에서 컨테이너용으로 덮어쓴다.
+    # 운영(EC2)에서는 이 파일 대신 SSM/Secrets Manager 로 주입한다.
+    env_file:
+      - path: ../apps/server/.env
+        required: false
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:5173}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      RUN_MIGRATIONS: "true"
+    ports:
+      - "127.0.0.1:${APP_HOST_PORT:-3001}:3000"
+
+volumes:
+  pgdata:
+  redisdata:
